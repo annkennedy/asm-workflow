@@ -15,6 +15,62 @@ import pickle
 import pdb
 import cv2
 import progressbar as pb
+import array
+
+
+class S3File(io.RawIOBase):
+    # added a new class to support read/write/seek from S3 files
+    def __init__(self, s3_object):
+        self.s3_object = s3_object
+        self.position = 0
+
+    def __repr__(self):
+        return "<%s s3_object=%r>" % (type(self).__name__, self.s3_object)
+
+    @property
+    def size(self):
+        return self.s3_object.content_length
+
+    def tell(self):
+        return self.position
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        if whence == io.SEEK_SET:
+            self.position = offset
+        elif whence == io.SEEK_CUR:
+            self.position += offset
+        elif whence == io.SEEK_END:
+            self.position = self.size + offset
+        else:
+            raise ValueError("invalid whence (%r, should be %d, %d, %d)" % (
+                whence, io.SEEK_SET, io.SEEK_CUR, io.SEEK_END
+            ))
+
+        return self.position
+
+    def seekable(self):
+        return True
+
+    def read(self, size=-1):
+        if size == -1:
+            # Read to the end of the file
+            range_header = "bytes=%d-" % self.position
+            self.seek(offset=0, whence=io.SEEK_END)
+        else:
+            new_position = self.position + size
+
+            # If we're going to read beyond the end of the object, return
+            # the entire object.
+            if new_position >= self.size:
+                return self.read()
+
+            range_header = "bytes=%d-%d" % (self.position, new_position - 1)
+            self.seek(offset=size, whence=io.SEEK_CUR)
+
+        return self.s3_object.get(Range=range_header)["Body"].read()
+
+    def readable(self):
+        return True
 
 # Create interface sr for reading seq files.
 #   sr = seqIo_reader( fName )
@@ -42,30 +98,26 @@ FRAME_FORMAT_MONOB_JPEG = 103 #JBRGB
 FRAME_FORMAT_PNG_GRAY = 0o1 #PNG
 FRAME_FORMAT_PNG_COLOR =0o2 #PNG
 
-#matlab equivalend fread
 def fread(fid, nelements, dtype):
 
     """Equivalent to Matlab fread function"""
 
-    if dtype is np.str:
-        dt = np.uint8  # WARNING: assuming 8-bit ASCII for np.str!
-    else:
-        dt = dtype
-
-    data_array = np.fromfile(fid, dt, nelements)
-    if data_array.size==1:data_array=data_array[0]
+    data_array = array.array(dtype)    
+    data_array.fromfile(fid, nelements)
+    if len(data_array)==1:
+        data_array = data_array[0]
     return data_array
 
-def fwrite(fid,a,dtype=np.str):
+def fwrite(fid,a,dtype='B'):
     # assuming 8but ASCII for string
     if dtype is np.str:
-        dt = np.uint8  # WARNING: assuming 8-bit ASCII for np.str!
+        dt = np.uint8
     else:
         dt = dtype
     if isinstance(a,np.ndarray):
-        data_array = a.astype(dt)
+        data_array = a.astype(dtype)
     else:
-        data_array = np.array(a).astype(dt)
+        data_array = np.array(a).astype(dttype)
     data_array.tofile(fid)
 
 def tsSync(video_path, srTop,srFront):
@@ -425,9 +477,15 @@ def syncTopFront(f,num_frames,num_framesf):
 
 
 class seqIo_reader():
-    def __init__(self,filename,info=[]):
+    def __init__(self,filename,s3_resource,info=[]):
         self.filename = filename
-        try: self.file=open(filename,'rb')
+        
+        #new!
+        bucket,movie_file = os.path.split(filename)
+        bucket = bucket.replace('s3://','')
+        s3_obj = s3_resource.Object(bucket_name=bucket, key=movie_file)
+        
+        try: self.file = S3File(s3_obj)
         except EnvironmentError as e: print(os.strerror(e.errno))
         self.header={}
         self.seek_table=None
@@ -447,35 +505,35 @@ class seqIo_reader():
         # pdb.set_trace()
 
         # Read 1024 bytes (len of header)
-        tmp = fread(self.file,1024,np.uint8)
+        tmp = fread(self.file,1024,'B')        
         #check that the header is not all 0's
         n=len(tmp)
         if n<1024:raise ValueError('no header')
-        if all(tmp==0): raise ValueError('fully empty header')
+        
         self.file.seek(0,0)
         #first 4 bytes stor 0XFEED next 24 store 'Norpix seq '
-        magic_number = fread(self.file,1,np.uint32)
-        name = fread(self.file,10,np.uint16)
+        magic_number = fread(self.file,1,'I')
+        name = fread(self.file,10,'H')
         name = ''.join(map(chr,name))
         if not '{0:X}'.format(magic_number)=='FEED' or not name=='Norpix seq':raise ValueError('invalid header')
         self.file.seek(4,1)
         #next 8 bytes for version and header size (1024) then 512 for desc
-        version = int(fread(self.file,1,np.int32))
-        hsize =int(fread(self.file,1,np.uint32))
+        version = int(fread(self.file,1,'i'))
+        hsize =int(fread(self.file,1,'I'))
         assert(hsize)==1024 ,"incorrect header size"
         # d = self.file.read(512)
-        descr=fread(self.file,256,np.uint16)
+        descr=fread(self.file,256,'H')
         # descr = ''.join(map(chr,descr))
         # descr = ''.join(map(unichr,descr)).replace('\x00',' ')
-        descr = ''.join([unichr(x) for x in descr]).replace('\x00',' ')
+        descr = ''.join([chr(x) for x in descr]).replace('\x00',' ')
         descr = descr.encode('utf-8')
         #read more info
-        tmp = fread(self.file,9,np.uint32)
+        tmp = fread(self.file,9,'I')
         assert tmp[7]==0, "incorrect origin"
-        fps = fread(self.file,1,np.float64)
+        fps = fread(self.file,1,'d')
         codec = 'imageFormat' + '%03d'%tmp[5]
-        desc_format = fread(self.file,1,np.uint32)
-        padding = fread(self.file,428,np.uint8)
+        desc_format = fread(self.file,1,'I')
+        padding = fread(self.file,428,'B')
         padding = ''.join(map(chr,padding))
         #store info
         self.header={'magicNumber':magic_number,
@@ -541,7 +599,10 @@ class seqIo_reader():
 
         if self.compressed:
             i=1
+            print('building seek table for %d frames (this takes a while) ...' % n)
             while (True):
+                if(i%1000==0):
+                    print('frame %d' % i)
                 try:
                     # size = fread(self.file,1,np.uint32)
                     # offset = seek_table[i-1] + size +extra
@@ -549,12 +610,12 @@ class seqIo_reader():
                     # # seek_table[i-1,1]=size
                     # self.file.seek(size-4+extra,1)
 
-                    size = fread(self.file, 1, np.uint32)
+                    size = fread(self.file, 1, 'I')
                     offset = seek_table[i - 1] + size + extra
                     # self.file.seek(size-4+extra,1)
                     self.file.seek(offset, 0)
                     if i == 1:
-                        if fread(self.file, 1, np.uint32) != 0:
+                        if fread(self.file, 1, 'I') != 0:
                             self.file.seek(-4, 1)
                         else:
                             extra += 8;
@@ -602,9 +663,9 @@ class seqIo_reader():
                 self.file.seek(1024 + i*self.header['trueImageSize']+self.header['imageSizeBytes'],0)
             else: #compressed
                 self.file.seek(self.seek_table[i],0)
-                self.file.seek(fread(self.file,1,np.uint32)-4,1)
+                self.file.seek(fread(self.file,1,'I')-4,1)
             # print i
-            ts[i]=fread(self.file,1,np.uint32)+fread(self.file,1,np.uint16)/1000.
+            ts[i]=fread(self.file,1,'I')+fread(self.file,1,'H')/1000.
 
 
         self.ts=ts
@@ -616,7 +677,7 @@ class seqIo_reader():
         if self.ext in ['raw','brgb8']: #read in an uncompressed iamge( assume imageBitDepthReal==8)
             shape = (self.header['height'], self.header['width'])
             self.file.seek(1024 + index*self.header['trueImageSize'],0)
-            I = fread(self.file,self.header['imageSizeBytes'],np.uint8)
+            I = fread(self.file,self.header['imageSizeBytes'],'B')
 
             if decode:
                 if nch==1:
@@ -631,20 +692,20 @@ class seqIo_reader():
         elif self.ext in ['jpg','jbrgb']:
             if decode:
                 self.file.seek(self.seek_table[index],0)
-                nBytes = fread(self.file,1,np.uint32)
-                data = fread(self.file,nBytes-4,np.uint8)
+                nBytes = fread(self.file,1,'I')
+                data = fread(self.file,nBytes-4,'B')
                 I = PIL.Image.open(io.BytesIO(data))
                 if self.ext == 'jbrgb':
                     I=colour_demosaicing.demosaicing_CFA_Bayer_bilinear(I,'BGGR')
 
         elif self.ext=='png':
             self.file.seek(self.seek_table[index],0)
-            nBytes = fread(self.file,1,np.uint32)
-            I= fread(self.file,nBytes-4,np.uint8)
+            nBytes = fread(self.file,1,'I')
+            I= fread(self.file,nBytes-4,'B')
             if decode:
                 I= np.array(I).transpose(range(I.shape,-1,-1))
         else: assert(False)
-        ts = fread(self.file,1,np.uint32)+fread(self.file,1,np.uint16)/1000.
+        ts = fread(self.file,1,'I')+fread(self.file,1,'H')/1000.
         return np.array(I),ts
 
     # Close the file
@@ -658,7 +719,7 @@ class seqIo_writer():
         self.header=old_header
 
         #create space for header
-        fwrite(self.file,np.zeros(1024).astype(int),np.uint8)
+        fwrite(self.file,np.zeros(1024).astype(int),'B')
 
         assert(set(['width','height','fps','codec']).issubset(self.header.keys()))
 
@@ -687,22 +748,22 @@ class seqIo_writer():
     def writeHeader(self):
         self.file.seek(0,0)
         # first write 4 bytes to store 0XFEED, next 24 store 'Nrpix seq  '
-        fwrite(self.file,int('FEED',16),np.uint32)
+        fwrite(self.file,int('FEED',16),'I')
         name = np.array(['Norpix seq  ']).view(np.uint8)
-        fwrite(self.file,name, np.uint16)
+        fwrite(self.file,name, 'H')
         # next 8 bytes for version (3) and header size (1024) then 512 for descr
-        fwrite(self.file,[3,1024],np.int32)
+        fwrite(self.file,[3,1024],'i')
         if not 'descr' in self.header.keys() or len(np.array([self.header['descr']]).view(np.uint8))>256: d = np.array(['No Description']).view(np.uint8)
         else: d= np.array([self.header['descr']]).view(np.uint8)
         d = np.concatenate((d[:np.minimum(256,len(d))],np.zeros(256-len(d)).astype(np.uint8)))
-        fwrite(self.file,d,np.uint16)
+        fwrite(self.file,d,'H')
         #write remaining info
         vals= [self.header['width'],self.header['height'],self.header['imageBitDepth'],self.header['imageBitDepthReal'],
                self.header['imageSizeBytes'],self.header['imageFormat'],self.header['numFrames'],0,self.header['trueImageSize']]
-        fwrite(self.file,vals,np.uint32)
+        fwrite(self.file,vals,'I')
         #store frame rate nad pad with 0s
-        fwrite(self.file,self.header['fps'],np.float64)
-        fwrite(self.file,np.zeros(432),np.uint8)
+        fwrite(self.file,self.header['fps'],'d')
+        fwrite(self.file,np.zeros(432),'B')
 
     def addFrame(self,I,ts=0,encode=1):
         nCh = self.header['imageBitDepth']/8
@@ -722,7 +783,7 @@ class seqIo_writer():
                 else: I = np.transpose( np.expand_dims(I, axis=2), (2, 1, 0) )
             # I= I.flat.view(np.uint8)
             I= I.flat
-            fwrite(self.file,I,np.uint8)
+            fwrite(self.file,I,'B')
             pad = self.header['trueImageSize']-self.header['imageSizeBytes']-6
         if ext =='jpg':
             if encode:
@@ -739,19 +800,19 @@ class seqIo_writer():
                 os.remove('tmp.jpg')
                 I = np.array(list(b)).astype(np.uint8)
             nbytes = len(I)+4
-            fwrite(self.file,nbytes,np.uint32)
+            fwrite(self.file,nbytes,'I')
             # self.file.write(I)
-            fwrite(self.file,I,np.uint8)
+            fwrite(self.file,I,'B')
             pad = 10
         if ts==0: ts = (c-1)/self.header['fps']
         s = int(np.floor(ts))
         ms = int(np.round(np.mod(ts,1)*1000))
-        fwrite(self.file,s,np.int32)
-        fwrite(self.file,ms,np.uint16)
+        fwrite(self.file,s,'i')
+        fwrite(self.file,ms,'H')
         self.header['numFrames']=c
         if pad>0:
             pad = np.zeros(pad).astype(np.uint8)
-            fwrite(self.file,pad,np.uint8)
+            fwrite(self.file,pad,'B')
 
 class seqIo_crop():
     # Crop sub-sequence from seq file.
