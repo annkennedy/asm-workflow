@@ -6,12 +6,12 @@
   </div>
     <crowd-keypoint
         src="{{ task.input.taskObject | grant_read_access }}"
-        labels="['nose','right ear','left ear','top of neck','right rear knee','left rear knee','base of tail']"
-        header="Label body parts of the BLACK mouse."
+        labels="['black mouse nose','black mouse right ear','black mouse left ear','black mouse top of neck','black mouse right rear knee','black mouse left rear knee','black mouse base of tail','white mouse nose','white mouse right ear','white mouse left ear','white mouse top of neck','white mouse right rear knee','white mouse left rear knee','white mouse base of tail']"
+        header="Label body parts of the two mice."
         name="annotatedResult">
 		
           <short-instructions> <!-- Replace these with the instructions for your task! -->
-            Label each body part of interest on the BLACK mouse.
+            Label each body part of interest on the two mice.
             <br><br>
             If a part is not visible, use the Top view for help to guess its location.
             <br><br>
